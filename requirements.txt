@@ -1,0 +1,20 @@
+# Web Framework
+flask
+Flask-Cors
+
+# Data Handling & Scientific Computing
+pandas
+numpy
+
+# Image Processing & OCR
+Pillow
+opencv-python-headless
+pytesseract
+deepface
+
+# Security & PDF Generation
+cryptography
+fpdf
+
+# Google Firebase
+firebase-admin
