@@ -15,22 +15,25 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 
 # --- 1. CONFIGURATION & FIREBASE INITIALIZATION ---
-pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-ENCRYPTION_KEY = Fernet.generate_key() # In a real app, store this key securely!
+
+# CRITICAL FIX: The hardcoded Windows Tesseract path has been REMOVED.
+# The Dockerfile installs Tesseract so pytesseract will find it automatically.
+
+ENCRYPTION_KEY = Fernet.generate_key()
 cipher_suite = Fernet(ENCRYPTION_KEY)
 
-# Initialize Firebase using your service account key
+# CRITICAL FIX: Initialize Firebase using the application default credentials.
+# This is the standard for Cloud Run and does not require a JSON key file.
 try:
-    cred_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', 'firebase_creds.json')
-    cred = credentials.Certificate(cred_path)
-    # This check prevents a crash if the script is reloaded (e.g., by Flask's debugger)
     if not firebase_admin._apps:
-        firebase_admin.initialize_app(cred)
+        # No credentials file needed when running on Google Cloud.
+        # It automatically uses the service account identity.
+        firebase_admin.initialize_app()
     db = firestore.client()
-    print("Firebase Firestore initialized successfully.")
+    print("✅ Firebase Firestore initialized successfully.")
 except Exception as e:
     print(f"❌ FIREBASE INITIALIZATION FAILED: {e}")
-    print("Please ensure 'firebase_creds.json' is in your main project folder (SEBI/).")
+    print("Ensure the Cloud Run service has an associated service account with the 'Cloud Datastore User' role.")
     db = None
 
 # --- 2. DATABASE FUNCTIONS (REWRITTEN FOR FIRESTORE) ---
@@ -43,43 +46,32 @@ def log_kyc_to_database(kyc_data):
     """Logs verified KYC data and synthesizes a dynamic profile in Firestore."""
     if not db: return
 
-    # Generate a new unique Client ID by counting existing clients
     clients_ref = db.collection('clients')
     client_count = len(list(clients_ref.stream()))
     new_client_id = f"CL{1001 + client_count}"
-
     today_iso = date.today().isoformat()
     expiry_iso = (date.today() + timedelta(days=8*365)).isoformat()
     
     client_doc_data = {
-        'client_id': new_client_id,
-        'full_name': kyc_data.get("Name", "N/A"),
-        'pan_number': kyc_data.get("PAN Number", "N/A"),
-        'dob': kyc_data.get("Date of Birth"),
-        'address': kyc_data.get("Address", "N/A"),
-        'kyc_last_updated': today_iso,
-        'kyc_expiry_date': expiry_iso,
-        'risk_category': 'Medium'
+        'client_id': new_client_id, 'full_name': kyc_data.get("Name", "N/A"),
+        'pan_number': kyc_data.get("PAN Number", "N/A"), 'dob': kyc_data.get("Date of Birth"),
+        'address': kyc_data.get("Address", "N/A"), 'kyc_last_updated': today_iso,
+        'kyc_expiry_date': expiry_iso, 'risk_category': 'Medium'
     }
     
-    # Use a batch to write all data atomically (all succeed or all fail)
     batch = db.batch()
-    
     client_ref = clients_ref.document(new_client_id)
     batch.set(client_ref, client_doc_data)
-    
     balance_ref = db.collection('client_balances').document(new_client_id)
     batch.set(balance_ref, {
         'balance': round(random.uniform(50000, 200000), 2),
         'last_updated': firestore.SERVER_TIMESTAMP
     })
-    
     batch.commit()
     print(f"\n✅ KYC for {kyc_data.get('Name')} logged to Firestore. Client ID: {new_client_id}")
 
 # --- 3. LOCAL KYC PROCESSING ENGINE (Unchanged) ---
 def process_local_kyc(selfie_path, pan_path, aadhaar_front_path, aadhaar_back_path, user_name_input):
-    # This entire function and its helpers remain the same as they operate before the database.
     try:
         face_result = DeepFace.verify(img1_path=selfie_path, img2_path=aadhaar_front_path, model_name="VGG-Face", enforce_detection=False)
         if not face_result.get("verified", False): return {"status": "failed", "reason": "Face verification failed."}
@@ -126,9 +118,8 @@ def mask_number(number, visible_digits=4):
     if number is None or len(number) <= visible_digits: return number
     return "X" * (len(number) - visible_digits) + number[-visible_digits:]
 
-# --- 4. DATABASE-DRIVEN COMPLIANCE FUNCTIONS (REWRITTEN FOR FIRESTORE) ---
+# --- 4. DATABASE-DRIVEN COMPLIANCE FUNCTIONS ---
 def check_client_funds_from_db(bank_statement_path):
-    """Compares client funds from Firestore with the bank statement balance."""
     if not db: return {"status": "ERROR", "reason": "Firestore not connected."}
     try:
         balances_ref = db.collection('client_balances').stream()
@@ -143,7 +134,6 @@ def check_client_funds_from_db(bank_statement_path):
         return {"status": "ERROR", "reason": str(e)}
 
 def get_expiring_kyc_from_db():
-    """Queries Firestore to find clients with KYC expiring soon."""
     if not db: return None, "Firestore not connected."
     try:
         today_iso = date.today().isoformat()
@@ -155,7 +145,6 @@ def get_expiring_kyc_from_db():
         return None, str(e)
 
 def send_kyc_notification(client_id):
-    """Simulates sending a KYC renewal notification by fetching data from Firestore."""
     if not db: return None, "Firestore not connected."
     try:
         client_ref = db.collection('clients').document(client_id)
@@ -169,227 +158,131 @@ def send_kyc_notification(client_id):
     except Exception as e:
         return None, str(e)
 
-# (Other complex functions like reports and surveillance would also be refactored)
-# For now, here are the placeholders showing they would connect to Firestore
 def generate_margin_report_from_db():
-    """
-    Generates a Daily Margin Report by querying the Firestore 'trades' collection
-    for all trades that occurred on the current day.
-    """
-    if not db:
-        return None, "Firestore not connected."
+    if not db: return None, "Firestore not connected."
     try:
-        # --- Step 1: Query Firestore for Today's Trades ---
         today = date.today()
         start_of_day = datetime.combine(today, datetime.min.time())
         end_of_day = datetime.combine(today, datetime.max.time())
-
-        # Create a query to get all documents from the 'trades' collection for the current day
         trades_query = db.collection('trades').where('trade_date', '>=', start_of_day).where('trade_date', '<=', end_of_day).stream()
-        
-        # Convert the Firestore documents into a list of dictionaries
         trades_list = [trade.to_dict() for trade in trades_query]
-        
-        if not trades_list:
-            return None, "No trades found for today in the Firestore database."
-
-        # Convert the list into a Pandas DataFrame for easy calculation
+        if not trades_list: return None, "No trades found for today in the Firestore database."
         trade_df = pd.DataFrame(trades_list)
-
-        # --- Step 2: Perform Calculations ---
         trade_df['total_trade_value'] = trade_df['quantity'] * trade_df['price_per_share']
-        
-        # Assume a flat 20% margin requirement for this example
         trade_df['margin_required'] = trade_df['total_trade_value'] * 0.20
-        
-        # In a real system, margin_collected would also be in the DB. We'll simulate it.
         trade_df['margin_collected'] = trade_df['margin_required'] * np.random.uniform(0.95, 1.2, size=len(trade_df))
         trade_df['margin_collected'] = trade_df['margin_collected'].round(2)
-
-        # Check if collected margin meets the requirement
-        trade_df['margin_status'] = np.where(
-            trade_df['margin_collected'] >= trade_df['margin_required'], 
-            'OK', 
-            'SHORTFALL'
-        )
-
-        # --- Step 3: Format and Save the Report ---
-        report_columns = [
-            'client_id', 'stock_symbol', 'trade_type', 'quantity', 
-            'price_per_share', 'total_trade_value', 'margin_required', 
-            'margin_collected', 'margin_status'
-        ]
-        # Ensure all required columns exist before trying to select them
+        trade_df['margin_status'] = np.where(trade_df['margin_collected'] >= trade_df['margin_required'], 'OK', 'SHORTFALL')
+        report_columns = ['client_id', 'stock_symbol', 'trade_type', 'quantity', 'price_per_share', 'total_trade_value', 'margin_required', 'margin_collected', 'margin_status']
         report_df = trade_df.reindex(columns=report_columns, fill_value='N/A')
-
+        
+        # CRITICAL FIX: Write to the /tmp directory, which is writable on Cloud Run
         report_filename = f"Margin_Report_{today.strftime('%d-%m-%Y')}.csv"
-        report_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', 'data', report_filename)
+        report_path = os.path.join('/tmp', report_filename)
         
         report_df.to_csv(report_path, index=False)
-        
         return report_path, None
-
     except Exception as e:
         return None, str(e)
 
 def run_surveillance_checks_from_db():
-    """
-    Runs surveillance checks by querying the Firestore 'trades' collection for today's trades.
-    """
     if not db: return None, "Firestore not connected."
     try:
-        # Helper function to get today's trades
         def get_trades_for_today():
             today = date.today()
             start_of_day = datetime.combine(today, datetime.min.time())
             end_of_day = datetime.combine(today, datetime.max.time())
             trades_query = db.collection('trades').where('trade_date', '>=', start_of_day).where('trade_date', '<=', end_of_day).stream()
             return pd.DataFrame([trade.to_dict() for trade in trades_query])
-
         df = get_trades_for_today()
-        if df.empty:
-            return {"status": "success", "flagged_trades": []}, None
-
+        if df.empty: return {"status": "success", "flagged_trades": []}, None
         flagged_trades = []
         df['trade_value'] = df['quantity'] * df['price_per_share']
-
-        # --- Run All Surveillance Rules ---
-        # Rule 1: Large Trade Value
         large_trades = df[df['trade_value'] > 500000]
         for _, row in large_trades.iterrows():
              flagged_trades.append({"client_id": row['client_id'], "stock_symbol": row['stock_symbol'], "reason": "Large Trade Value"})
-        
-        # (Your other surveillance rules would be added here in the same way)
-
         unique_flags = [dict(t) for t in {tuple(d.items()) for d in flagged_trades}]
         return {"status": "success", "flagged_trades": unique_flags}, None
     except Exception as e:
         return None, str(e)
 
 def generate_suspicious_trade_pdf(flagged_trades):
-    """
-    Takes a list of flagged trades and generates a formatted PDF report.
-    This function does not need to change as it only formats data.
-    """
     try:
         pdf = FPDF()
         pdf.add_page()
-
-        # Report Header
         pdf.set_font("Arial", 'B', 16)
         pdf.cell(0, 10, 'Suspicious Activity Report', 0, 1, 'C')
         pdf.set_font("Arial", '', 10)
         pdf.cell(0, 10, f"Date: {date.today().strftime('%d-%m-%Y')}", 0, 1, 'C')
         pdf.ln(10)
-
-        # Report Body
         if not flagged_trades:
             pdf.set_font("Arial", '', 12)
             pdf.cell(0, 10, "No suspicious activities were detected.", 0, 1, 'C')
         else:
             pdf.set_font("Arial", 'B', 11)
-            pdf.cell(40, 10, 'Client ID', 1)
-            pdf.cell(40, 10, 'Stock Symbol', 1)
-            pdf.cell(0, 10, 'Reason for Flag', 1)
-            pdf.ln()
+            pdf.cell(40, 10, 'Client ID', 1); pdf.cell(40, 10, 'Stock Symbol', 1); pdf.cell(0, 10, 'Reason for Flag', 1); pdf.ln()
             pdf.set_font("Arial", '', 10)
             for trade in flagged_trades:
                 pdf.cell(40, 10, str(trade.get("client_id", "N/A")), 1)
                 pdf.cell(40, 10, str(trade.get("stock_symbol", "N/A")), 1)
                 pdf.multi_cell(0, 10, str(trade.get("reason", "N/A")), 1)
-
-        # Save the PDF
-        report_filename = f"Suspicious_Activity_Report_{date.today().strftime('%d-%m-%Y')}.pdf"
-        report_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', 'data', report_filename)
-        pdf.output(report_path)
         
+        # CRITICAL FIX: Write to the /tmp directory
+        report_filename = f"Suspicious_Activity_Report_{date.today().strftime('%d-%m-%Y')}.pdf"
+        report_path = os.path.join('/tmp', report_filename)
+        pdf.output(report_path)
         return report_path, None
     except Exception as e:
         return None, str(e)
 
 def run_quarterly_settlement_check():
-    """
-    Identifies clients from Firestore whose funds are idle for more than 90 days.
-    """
     if not db: return None, "Firestore not connected."
     try:
         ninety_days_ago = datetime.now() - timedelta(days=90)
         settlement_due_clients = []
-        
-        # Get all clients with a positive balance
         balances_ref = db.collection('client_balances').where('balance', '>', 0).stream()
-        
         for bal_doc in balances_ref:
             client_id = bal_doc.id
             balance = bal_doc.to_dict().get('balance', 0)
-            
-            # For each client, find their most recent trade
             trades_query = db.collection('trades').where('client_id', '==', client_id).order_by('trade_date', direction=firestore.Query.DESCENDING).limit(1).stream()
             last_trade = next(trades_query, None)
-            
-            # Check if the last trade was more than 90 days ago
             if last_trade and last_trade.to_dict()['trade_date'] < ninety_days_ago:
                 client_doc = db.collection('clients').document(client_id).get()
                 if client_doc.exists:
                     settlement_due_clients.append({
-                        "client_id": client_id,
-                        "full_name": client_doc.to_dict().get('full_name'),
-                        "balance": balance,
-                        "days_since_last_trade": (datetime.now() - last_trade.to_dict()['trade_date']).days
+                        "client_id": client_id, "full_name": client_doc.to_dict().get('full_name'),
+                        "balance": balance, "days_since_last_trade": (datetime.now() - last_trade.to_dict()['trade_date']).days
                     })
-        
         return {"status": "success", "settlement_due_clients": settlement_due_clients}, None
     except Exception as e:
         return None, str(e)
 
 def generate_qs_report_pdf(settlement_due_clients):
-    """
-    Takes a list of clients due for settlement and generates a formatted PDF report.
-    """
     try:
         pdf = FPDF()
         pdf.add_page()
-
-        # Report Header
         pdf.set_font("Arial", 'B', 16)
         pdf.cell(0, 10, 'Quarterly Settlement Report for Payout', 0, 1, 'C')
         pdf.set_font("Arial", '', 10)
         pdf.cell(0, 10, f"Report Date: {date.today().strftime('%d-%m-%Y')}", 0, 1, 'C')
         pdf.ln(10)
-
-        # Report Body
         if not settlement_due_clients:
             pdf.set_font("Arial", '', 12)
             pdf.cell(0, 10, "No clients are due for quarterly settlement at this time.", 0, 1, 'C')
         else:
             pdf.set_font("Arial", 'B', 11)
-            pdf.cell(30, 10, 'Client ID', 1)
-            pdf.cell(70, 10, 'Client Name', 1)
-            pdf.cell(40, 10, 'Balance to Settle', 1)
-            pdf.cell(0, 10, 'Days Idle', 1)
-            pdf.ln()
+            pdf.cell(30, 10, 'Client ID', 1); pdf.cell(70, 10, 'Client Name', 1); pdf.cell(40, 10, 'Balance to Settle', 1); pdf.cell(0, 10, 'Days Idle', 1); pdf.ln()
             pdf.set_font("Arial", '', 10)
             for client in settlement_due_clients:
                 pdf.cell(30, 10, str(client.get("client_id", "N/A")), 1)
                 pdf.cell(70, 10, str(client.get("full_name", "N/A")), 1)
                 pdf.cell(40, 10, f"Rs. {client.get('balance', 0):,.2f}", 1)
-                pdf.cell(0, 10, str(int(client.get("days_since_last_trade", 0))), 1)
-                pdf.ln()
-
-        # Save the PDF
-        report_filename = f"Quarterly_Settlement_Report_{date.today().strftime('%d-%m-%Y')}.pdf"
-        report_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', 'data', report_filename)
-        pdf.output(report_path)
+                pdf.cell(0, 10, str(int(client.get("days_since_last_trade", 0))), 1); pdf.ln()
         
+        # CRITICAL FIX: Write to the /tmp directory
+        report_filename = f"Quarterly_Settlement_Report_{date.today().strftime('%d-%m-%Y')}.pdf"
+        report_path = os.path.join('/tmp', report_filename)
+        pdf.output(report_path)
         return report_path, None
     except Exception as e:
         return None, str(e)
-
-
-
-# (Other functions like generate reports, run surveillance would be similarly refactored)
-# Placeholder for other functions
-
-
-
-

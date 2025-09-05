@@ -1,20 +1,24 @@
-# Web Framework
-flask
-Flask-Cors
+# FastAPI and Server
+fastapi
+uvicorn[standard]
+python-multipart
 
-# Data Handling & Scientific Computing
+# Firebase
+firebase-admin
+
+# Data Handling and ML
 pandas
 numpy
-
-# Image Processing & OCR
-Pillow
-opencv-python-headless
-pytesseract
 deepface
+opencv-python-headless
+Pillow
+tf-keras
 
-# Security & PDF Generation
-cryptography
+
+# OCR and PDF
+pytesseract
 fpdf
 
-# Google Firebase
-firebase-admin
+# Utilities
+cryptography
+requests

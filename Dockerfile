@@ -4,27 +4,25 @@ FROM python:3.10-slim-bullseye
 # Set the working directory in the container
 WORKDIR /app
 
-# --- Install System Dependencies ---
-# Update package lists and install Tesseract OCR and other libraries needed by OpenCV.
-# This is a critical step as pytesseract is just a wrapper for the Tesseract engine.
+# Install system dependencies including Tesseract for OCR
 RUN apt-get update && apt-get install -y \
     tesseract-ocr \
     libgl1-mesa-glx \
     && rm -rf /var/lib/apt/lists/*
 
-# --- Install Python Dependencies ---
-# Copy the requirements file into the container
+# Copy only the requirements file to leverage Docker cache
 COPY requirements.txt .
 
-# Install the Python dependencies
+# Install Python dependencies
+RUN pip install --no-cache-dir --upgrade pip
 RUN pip install --no-cache-dir -r requirements.txt
 
-# --- Copy Application Code ---
 # Copy the rest of your application's code into the container
 COPY . .
 
-# Expose the port the app runs on
+# Expose the port the app will run on
 EXPOSE 8080
 
-# Define the command to run your application
-CMD ["python", "app.py"]
+# Command to run the application using Uvicorn
+# Reads the PORT environment variable from Cloud Run, defaults to 8080 locally
+CMD uvicorn app:app --host 0.0.0.0 --port ${PORT:-8080}

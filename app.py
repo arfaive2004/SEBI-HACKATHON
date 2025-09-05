@@ -1,10 +1,14 @@
-from flask import Flask, request, jsonify, send_file, after_this_request
-from flask_cors import CORS
 import os
-from datetime import date, timedelta
+import shutil
+from typing import List, Dict, Any, Optional
 
-# --- 1. Import your Firestore-powered functions from the KYC subfolder ---
-# This list is updated to match the final functions in your kycchecker.py
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, BackgroundTasks
+from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import uvicorn
+
+# Assuming 'KYC' is a folder in the same directory as this app.py
 from KYC.kycchecker import (
     setup_database,
     log_kyc_to_database,
@@ -16,139 +20,135 @@ from KYC.kycchecker import (
     run_quarterly_settlement_check,
     generate_qs_report_pdf,
     send_kyc_notification,
-    get_expiring_kyc_from_db # <-- New function for this endpoint
+    get_expiring_kyc_from_db
 )
 
-# --- 2. SETUP ---
-app = Flask(__name__)
-CORS(app)
-# DB_PATH is no longer needed here as Firestore connection is managed in kycchecker.py
+app = FastAPI(
+    title="KYC & Compliance API",
+    description="An API for handling client KYC, compliance checks, and reporting.",
+    version="1.0.0"
+)
 
-# --- 3. API ENDPOINTS (Updated for Firestore Logic) ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-@app.route('/api/kyc/onboard', methods=['POST'])
-def onboard_client():
-    """API endpoint for the local KYC onboarding process."""
-    files = request.files
-    form_data = request.form
+class NotifyClientRequest(BaseModel):
+    client_id: str
+
+def remove_file(path: str) -> None:
+    """Utility function to remove a file from /tmp, used in background tasks."""
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+            print(f"Successfully removed temporary file: {path}")
+    except Exception as e:
+        print(f"Error removing file {path}: {e}")
+
+@app.on_event("startup")
+async def startup_event():
+    """Initializes the database connection when the API starts."""
+    print("Setting up database connection...")
+    setup_database()
+    print("Database connection established.")
+
+@app.post('/api/kyc/onboard', tags=["KYC"])
+async def onboard_client(
+    background_tasks: BackgroundTasks,
+    name: str = Form(...),
+    selfie: UploadFile = File(...),
+    pan: UploadFile = File(...),
+    aadhaar_front: UploadFile = File(...),
+    aadhaar_back: UploadFile = File(...)
+):
+    # CRITICAL FIX: Save temporary files to /tmp directory
+    temp_dir = "/tmp"
+    selfie_path = os.path.join(temp_dir, f"selfie_{selfie.filename}")
+    pan_path = os.path.join(temp_dir, f"pan_{pan.filename}")
+    aadhaar_front_path = os.path.join(temp_dir, f"aadhaar_front_{aadhaar_front.filename}")
+    aadhaar_back_path = os.path.join(temp_dir, f"aadhaar_back_{aadhaar_back.filename}")
     
-    if 'name' not in form_data:
-        return jsonify({"error": "Missing 'name' in the request body."}), 400
-    if not all(key in files for key in ['selfie', 'pan', 'aadhaar_front', 'aadhaar_back']):
-        return jsonify({"error": "Missing one or more required image files."}), 400
-
-    user_name = form_data['name']
+    temp_files = [selfie_path, pan_path, aadhaar_front_path, aadhaar_back_path]
     
-    # Save temporary files for processing
-    selfie_path = "temp_selfie.jpg"; files['selfie'].save(selfie_path)
-    pan_path = "temp_pan.jpg"; files['pan'].save(pan_path)
-    aadhaar_front_path = "temp_aadhaar_front.jpg"; files['aadhaar_front'].save(aadhaar_front_path)
-    aadhaar_back_path = "temp_aadhaar_back.jpg"; files['aadhaar_back'].save(aadhaar_back_path)
-    
-    result = process_local_kyc(
-        selfie_path, pan_path, aadhaar_front_path, aadhaar_back_path, user_name
-    )
+    try:
+        with open(selfie_path, "wb") as buffer: shutil.copyfileobj(selfie.file, buffer)
+        with open(pan_path, "wb") as buffer: shutil.copyfileobj(pan.file, buffer)
+        with open(aadhaar_front_path, "wb") as buffer: shutil.copyfileobj(aadhaar_front.file, buffer)
+        with open(aadhaar_back_path, "wb") as buffer: shutil.copyfileobj(aadhaar_back.file, buffer)
 
-    os.remove(selfie_path); os.remove(pan_path); os.remove(aadhaar_front_path); os.remove(aadhaar_back_path)
+        result = process_local_kyc(selfie_path, pan_path, aadhaar_front_path, aadhaar_back_path, name)
 
-    if result.get("status") == "success":
-        kyc_data = result["data"]
-        # Log the successful verification to Firestore
-        log_kyc_to_database(kyc_data)
-        return jsonify({"status": "success", "data": kyc_data}), 200
-    else:
-        return jsonify(result), 400
+        if result.get("status") == "success":
+            kyc_data = result["data"]
+            log_kyc_to_database(kyc_data)
+            return {"status": "success", "data": kyc_data}
+        else:
+            raise HTTPException(status_code=400, detail=result)
+            
+    finally:
+        for path in temp_files:
+            background_tasks.add_task(remove_file, path)
 
-# --- DATABASE-DRIVEN COMPLIANCE ENDPOINTS ---
+@app.post('/api/compliance/check-funds', tags=["Compliance"])
+async def client_funds_check_endpoint(
+    background_tasks: BackgroundTasks,
+    bank_statement: UploadFile = File(...)
+):
+    # CRITICAL FIX: Save temporary file to /tmp directory
+    bank_path = os.path.join("/tmp", f"bank_{bank_statement.filename}")
+    try:
+        with open(bank_path, "wb") as buffer:
+            shutil.copyfileobj(bank_statement.file, buffer)
+        result = check_client_funds_from_db(bank_path)
+        return result
+    finally:
+        background_tasks.add_task(remove_file, bank_path)
 
-@app.route('/api/compliance/check-funds', methods=['POST'])
-def client_funds_check_endpoint():
-    """API endpoint for client funds check. Reads balances from Firestore."""
-    if 'bank_statement' not in request.files:
-        return jsonify({"error": "Missing 'bank_statement' file."}), 400
-
-    bank_path = "temp_bank.csv"; request.files['bank_statement'].save(bank_path)
-    result = check_client_funds_from_db(bank_path)
-    os.remove(bank_path)
-
-    return jsonify(result)
-
-@app.route('/api/reports/generate-margin-report', methods=['GET'])
-def generate_margin_report_endpoint():
-    """API endpoint to generate the Daily Margin Report from Firestore."""
+@app.get('/api/reports/generate-margin-report', tags=["Reports"])
+async def generate_margin_report_endpoint():
     report_path, error = generate_margin_report_from_db()
     if error:
-        return jsonify({"error": f"Failed to generate report: {error}"}), 500
-    
-    @after_this_request
-    def cleanup(response):
-        try: os.remove(report_path)
-        except Exception as e: print(f"Error removing file: {e}")
-        return response
+        raise HTTPException(status_code=500, detail=f"Failed to generate report: {error}")
+    return FileResponse(path=report_path, filename=os.path.basename(report_path), background=BackgroundTasks([lambda: remove_file(report_path)]))
 
-    return send_file(report_path, as_attachment=True)
-
-@app.route('/api/surveillance/run-check', methods=['GET'])
-def run_surveillance_endpoint():
-    """API endpoint to run surveillance checks on Firestore and return a PDF."""
+@app.get('/api/surveillance/run-check', tags=["Surveillance"])
+async def run_surveillance_endpoint():
     result, error = run_surveillance_checks_from_db()
     if error:
-        return jsonify({"status": "error", "reason": error}), 500
-    
+        raise HTTPException(status_code=500, detail=f"Surveillance check failed: {error}")
     pdf_path, pdf_error = generate_suspicious_trade_pdf(result.get("flagged_trades", []))
     if pdf_error:
-        return jsonify({"status": "error", "reason": f"Failed to generate PDF: {pdf_error}"}), 500
-    
-    @after_this_request
-    def cleanup(response):
-        try: os.remove(pdf_path)
-        except Exception as e: print(f"Error removing PDF file: {e}")
-        return response
+        raise HTTPException(status_code=500, detail=f"Failed to generate PDF: {pdf_error}")
+    return FileResponse(path=pdf_path, filename=os.path.basename(pdf_path), background=BackgroundTasks([lambda: remove_file(pdf_path)]))
 
-    return send_file(pdf_path, as_attachment=True)
-
-@app.route('/api/compliance/run-quarterly-settlement', methods=['GET'])
-def run_qs_endpoint():
-    """API endpoint to run the quarterly settlement check and return a PDF."""
+@app.get('/api/compliance/run-quarterly-settlement', tags=["Compliance"])
+async def run_qs_endpoint():
     result, error = run_quarterly_settlement_check()
     if error:
-        return jsonify({"status": "error", "reason": error}), 500
-    
+        raise HTTPException(status_code=500, detail=f"Quarterly settlement check failed: {error}")
     pdf_path, pdf_error = generate_qs_report_pdf(result.get("settlement_due_clients", []))
     if pdf_error:
-        return jsonify({"status": "error", "reason": f"Failed to generate PDF: {pdf_error}"}), 500
-    
-    @after_this_request
-    def cleanup(response):
-        try: os.remove(pdf_path)
-        except Exception as e: print(f"Error removing PDF file: {e}")
-        return response
+        raise HTTPException(status_code=500, detail=f"Failed to generate PDF: {pdf_error}")
+    return FileResponse(path=pdf_path, filename=os.path.basename(pdf_path), background=BackgroundTasks([lambda: remove_file(pdf_path)]))
 
-    return send_file(pdf_path, as_attachment=True)
-
-@app.route('/api/kyc/expiring', methods=['GET'])
-def get_expiring_kyc():
-    """API endpoint to get a list of clients from Firestore with expiring KYC."""
+@app.get('/api/kyc/expiring', tags=["KYC"])
+async def get_expiring_kyc():
     result, error = get_expiring_kyc_from_db()
     if error:
-        return jsonify({"error": f"Database error: {error}"}), 500
-    return jsonify(result)
+        raise HTTPException(status_code=500, detail=f"Database error: {error}")
+    return result
 
-@app.route('/api/clients/notify', methods=['POST'])
-def notify_client_endpoint():
-    """API endpoint to trigger a KYC renewal notification."""
-    data = request.get_json()
-    if not data or 'client_id' not in data:
-        return jsonify({"error": "Missing 'client_id'."}), 400
-    
-    result, error = send_kyc_notification(data['client_id'])
+@app.post('/api/clients/notify', tags=["Clients"])
+async def notify_client_endpoint(request: NotifyClientRequest):
+    result, error = send_kyc_notification(request.client_id)
     if error:
-        return jsonify({"status": "error", "reason": error}), 404
-    
-    return jsonify(result)
+        raise HTTPException(status_code=404, detail=error)
+    return result
 
 if __name__ == '__main__':
-    setup_database()
-    app.run(debug=True, port=8080)
-
-
+    # Corrected uvicorn command for local running
+    uvicorn.run("app:app", host="0.0.0.0", port=8080, reload=True)
